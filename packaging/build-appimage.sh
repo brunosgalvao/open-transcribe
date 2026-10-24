@@ -12,15 +12,17 @@ export LIBCLANG_PATH="${LIBCLANG_PATH:-$HOME/.local/lib/clang}"
 
 NAME="OpenTranscribe"
 APPDIR="$ROOT/dist/$NAME.AppDir"
-OUT="$ROOT/dist/$NAME-x86_64.AppImage"
 TOOL="$ROOT/.tools/appimagetool-x86_64.AppImage"
 FEATURES="cuda"
+VARIANT="CUDA"
 
 if [[ "${1:-}" == "--cpu" ]]; then
     FEATURES=""
-    OUT="$ROOT/dist/$NAME-CPU-x86_64.AppImage"
+    VARIANT="CPU"
     shift
 fi
+
+OUT="$ROOT/dist/$NAME-$VARIANT-x86_64.AppImage"
 
 echo "[1/5] Compilando (release)..."
 if [[ -n "$FEATURES" ]]; then

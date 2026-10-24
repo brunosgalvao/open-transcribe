@@ -63,6 +63,50 @@ jobs:
           path: dist/OpenTranscribe-windows-x86_64.zip
           if-no-files-found: error
 
+  linux-cuda:
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    container:
+      image: nvidia/cuda:13.0.0-devel-ubuntu22.04
+    steps:
+      - name: Instalar git e ferramentas básicas
+        run: |
+          apt-get update
+          apt-get install -y git curl ca-certificates xz-utils file
+      - uses: actions/checkout@v4
+      - name: Instalar dependências de build
+        run: |
+          apt-get install -y build-essential cmake pkg-config clang libclang-dev \
+            libgtk-3-dev libxkbcommon-dev libwayland-dev libx11-dev \
+            libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+      - name: Instalar Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      - name: Baixar ffmpeg estático
+        continue-on-error: true
+        run: |
+          curl -L --retry 3 -o /tmp/ffmpeg.tar.xz \
+            https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+          mkdir -p /tmp/ffmpeg-static
+          tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-static --strip-components=1
+          echo "FFMPEG_BIN=/tmp/ffmpeg-static/ffmpeg" >> "$GITHUB_ENV"
+      - name: Gerar AppImage (CUDA)
+        run: |
+          export PATH="$HOME/.cargo/bin:/usr/local/cuda/bin:$PATH"
+          LIB=$(find /usr/lib -name 'libclang.so' -print -quit)
+          if [ -n "$LIB" ]; then
+            export LIBCLANG_PATH=$(dirname "$LIB")
+          fi
+          bash packaging/build-appimage.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-cuda-appimage
+          path: dist/OpenTranscribe-CUDA-x86_64.AppImage
+          if-no-files-found: error
+
   macos:
     strategy:
       matrix:
@@ -106,7 +150,8 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [linux, windows, macos]
+    needs: [linux, windows, macos, linux-cuda]
+    if: always() && needs.linux.result == 'success' && needs.windows.result == 'success' && needs.macos.result == 'success'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@v4
