@@ -281,7 +281,11 @@ impl App {
     }
 
     fn start(&mut self) {
-        if self.running || self.downloading || self.files.is_empty() {
+        if self.running
+            || self.downloading
+            || self.downloading_update
+            || self.files.is_empty()
+        {
             return;
         }
         if !self.is_model_present() {
@@ -334,7 +338,7 @@ impl App {
         dest: PathBuf,
         kind: DownloadKind,
     ) {
-        if self.downloading || self.running {
+        if self.downloading || self.running || self.downloading_update {
             return;
         }
         self.log(format!("Baixando {label}..."));
@@ -2068,7 +2072,9 @@ impl UiActions {
         } else {
             if ui
                 .add_enabled(
-                    !app.files.is_empty() && !app.downloading,
+                    !app.files.is_empty()
+                        && !app.downloading
+                        && !app.downloading_update,
                     colored_button("Iniciar transcrição", START_BUTTON),
                 )
                 .clicked()
