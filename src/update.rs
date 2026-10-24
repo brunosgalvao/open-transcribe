@@ -155,7 +155,7 @@ pub fn download(asset: &AssetInfo, progress: &mut dyn FnMut(u64, u64)) -> Result
     let dest = dir.join(&asset.name);
     let mut response = reqwest::blocking::Client::builder()
         .user_agent(format!("open-transcribe/{VERSION}"))
-        .timeout(Duration::from_secs(600))
+        .timeout(Duration::from_secs(1800))
         .build()
         .context("não foi possível criar o cliente HTTP")?
         .get(&asset.url)
