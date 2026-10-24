@@ -13,6 +13,9 @@ if ($Features -eq "cpu") {
 } else {
     cargo build --release --no-default-features --features $Features
 }
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
 
 $Name = "OpenTranscribe"
 $Variant = switch ($Features) {

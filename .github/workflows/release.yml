@@ -64,7 +64,7 @@ jobs:
           if-no-files-found: error
 
   windows-cuda:
-    runs-on: windows-latest
+    runs-on: windows-2022
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
