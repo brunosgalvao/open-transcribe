@@ -15,8 +15,13 @@ if ($Features -eq "cpu") {
 }
 
 $Name = "OpenTranscribe"
-$Stage = Join-Path $Root "dist\windows"
-$Zip = Join-Path $Root "dist\$Name-windows-x86_64.zip"
+$Variant = switch ($Features) {
+    "cuda" { "CUDA" }
+    "vulkan" { "VULKAN" }
+    default { "CPU" }
+}
+$Stage = Join-Path $Root "dist\windows-$Variant"
+$Zip = Join-Path $Root "dist\$Name-$Variant-windows-x86_64.zip"
 
 Write-Host "[2/4] Montando pasta..."
 Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
@@ -41,6 +46,9 @@ if ($Features -eq "cuda" -and $env:CUDA_PATH) {
     foreach ($pattern in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll", "nvJitLink*.dll")) {
         Get-ChildItem (Join-Path $env:CUDA_PATH "bin") -Filter $pattern -ErrorAction SilentlyContinue |
             Copy-Item -Destination $Stage
+    }
+    if (-not (Get-ChildItem $Stage -Filter "cudart64_*.dll" -ErrorAction SilentlyContinue)) {
+        throw "DLL cudart64_* não encontrada em $env:CUDA_PATH\bin"
     }
 } else {
     Write-Host "[3/4] Sem DLLs CUDA."

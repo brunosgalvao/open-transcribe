@@ -60,7 +60,34 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows-zip
-          path: dist/OpenTranscribe-windows-x86_64.zip
+          path: dist/OpenTranscribe-CPU-windows-x86_64.zip
+          if-no-files-found: error
+
+  windows-cuda:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Instalar CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '13.0.0'
+          method: 'local'
+      - name: Instalar ffmpeg
+        run: choco install ffmpeg -y --no-progress
+      - name: Gerar pacote Windows CUDA
+        shell: pwsh
+        run: |
+          $env:FFMPEG_BIN = (Get-Command ffmpeg).Source
+          $env:CUDAToolkit_ROOT = $env:CUDA_PATH
+          $env:CMAKE_CUDA_COMPILER = Join-Path $env:CUDA_PATH "bin\nvcc.exe"
+          ./packaging/build-windows.ps1 -Features cuda
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-cuda-zip
+          path: dist/OpenTranscribe-CUDA-windows-x86_64.zip
           if-no-files-found: error
 
   linux-cuda:
@@ -150,7 +177,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [linux, windows, macos, linux-cuda]
+    needs: [linux, windows, macos, linux-cuda, windows-cuda]
     if: always() && needs.linux.result == 'success' && needs.windows.result == 'success' && needs.macos.result == 'success'
     runs-on: ubuntu-22.04
     steps:

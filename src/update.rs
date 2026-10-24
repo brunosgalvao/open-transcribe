@@ -106,10 +106,41 @@ fn platform_asset(assets: &[Asset]) -> Option<&Asset> {
     }
     #[cfg(target_os = "windows")]
     {
-        assets
-            .iter()
-            .find(|asset| asset.name.ends_with(".zip") && asset.name.contains("windows"))
-            .or_else(|| assets.iter().find(|asset| asset.name.ends_with(".zip")))
+        if cfg!(feature = "cuda") {
+            assets.iter().find(|asset| {
+                asset.name.ends_with(".zip")
+                    && asset.name.contains("windows")
+                    && asset.name.contains("CUDA")
+            })
+        } else if cfg!(feature = "vulkan") {
+            assets
+                .iter()
+                .find(|asset| {
+                    asset.name.ends_with(".zip")
+                        && asset.name.contains("windows")
+                        && asset.name.contains("VULKAN")
+                })
+                .or_else(|| {
+                    assets.iter().find(|asset| {
+                        asset.name.ends_with(".zip")
+                            && asset.name.contains("windows")
+                            && asset.name.contains("CPU")
+                    })
+                })
+        } else {
+            assets
+                .iter()
+                .find(|asset| {
+                    asset.name.ends_with(".zip")
+                        && asset.name.contains("windows")
+                        && asset.name.contains("CPU")
+                })
+                .or_else(|| {
+                    assets
+                        .iter()
+                        .find(|asset| asset.name.ends_with(".zip") && asset.name.contains("windows"))
+                })
+        }
     }
     #[cfg(target_os = "macos")]
     {

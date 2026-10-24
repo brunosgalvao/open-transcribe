@@ -26,10 +26,11 @@ https://github.com/brunosgalvao/open-transcribe/releases
 
 - **Linux (CPU):** `OpenTranscribe-CPU-x86_64.AppImage`
 - **Linux (NVIDIA/CUDA):** `OpenTranscribe-CUDA-x86_64.AppImage`
-- **Windows:** `OpenTranscribe-windows-x86_64.zip`
+- **Windows (CPU):** `OpenTranscribe-CPU-windows-x86_64.zip`
+- **Windows (NVIDIA/CUDA):** `OpenTranscribe-CUDA-windows-x86_64.zip`
 - **macOS:** `OpenTranscribe-macos-arm64.dmg` ou `OpenTranscribe-macos-x86_64.dmg`
 
-No Linux, use o AppImage **CUDA** se tiver placa NVIDIA com driver instalado. Não é preciso instalar o CUDA Toolkit; as bibliotecas necessárias vão dentro do AppImage.
+No Linux e no Windows, use o pacote **CUDA** se tiver placa NVIDIA com driver instalado. Não é preciso instalar o CUDA Toolkit; as bibliotecas necessárias vão dentro do AppImage/zip.
 
 O `ffmpeg` é necessário para extrair o áudio dos vídeos. Ele é incluído nos pacotes quando o build consegue empacotá-lo; caso contrário, instale o `ffmpeg` no sistema.
 
