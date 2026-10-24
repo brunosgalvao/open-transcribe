@@ -22,7 +22,7 @@
 
 Os binários ficam na página de releases:
 
-https://github.com/brunogalvao/open-transcribe/releases
+https://github.com/brunosgalvao/open-transcribe/releases
 
 - **Linux:** `OpenTranscribe-CPU-x86_64.AppImage`
 - **Windows:** `OpenTranscribe-windows-x86_64.zip`
@@ -89,7 +89,7 @@ Ele cria uma release **draft** no GitHub para revisão antes de publicar.
 
 ## Atualizações
 
-O aplicativo consulta a release mais recente em `brunogalvao/open-transcribe`. Se você fizer um fork, altere a constante `REPO` em `src/update.rs` e o campo `repository` em `Cargo.toml`.
+O aplicativo consulta a release mais recente em `brunosgalvao/open-transcribe`. Se você fizer um fork, altere a constante `REPO` em `src/update.rs` e o campo `repository` em `Cargo.toml`.
 
 No Linux, a atualização substitui o AppImage atual e reinicia o aplicativo. No Windows e macOS, o arquivo correto é baixado e aberto para instalação.
 

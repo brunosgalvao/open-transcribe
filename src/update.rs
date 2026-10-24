@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const REPO: &str = "brunogalvao/open-transcribe";
+pub const REPO: &str = "brunosgalvao/open-transcribe";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Deserialize)]
