@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Dependências do sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            xz-utils libgtk-3-dev libxkbcommon-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev
+      - name: Baixar ffmpeg estático
+        continue-on-error: true
+        run: |
+          curl -L --retry 3 -o /tmp/ffmpeg.tar.xz \
+            https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+          mkdir -p /tmp/ffmpeg-static
+          tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-static --strip-components=1
+          echo "FFMPEG_BIN=/tmp/ffmpeg-static/ffmpeg" >> "$GITHUB_ENV"
+      - name: Gerar AppImage (CPU)
+        run: bash packaging/build-appimage.sh --cpu
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: dist/OpenTranscribe-CPU-x86_64.AppImage
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Instalar ffmpeg
+        run: choco install ffmpeg -y --no-progress
+      - name: Gerar pacote Windows (CPU)
+        shell: pwsh
+        run: |
+          $env:FFMPEG_BIN = (Get-Command ffmpeg).Source
+          ./packaging/build-windows.ps1 -Features cpu
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: dist/OpenTranscribe-windows-x86_64.zip
+          if-no-files-found: error
+
+  macos:
+    strategy:
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    env:
+      MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Instalar ffmpeg
+        run: brew install ffmpeg dylibbundler
+      - name: Importar certificado Apple
+        if: env.MACOS_CERTIFICATE != ''
+        run: |
+          echo "$MACOS_CERTIFICATE" | base64 -D > certificate.p12
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security import certificate.p12 -k build.keychain \
+            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: -s -k actions build.keychain
+          rm certificate.p12
+      - name: Gerar DMG (Metal)
+        run: FFMPEG_BIN="$(command -v ffmpeg)" bash packaging/build-macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg-${{ matrix.arch }}
+          path: dist/OpenTranscribe-macos-*.dmg
+          if-no-files-found: error
+
+  release:
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: artifacts/**/*

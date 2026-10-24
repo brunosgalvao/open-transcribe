@@ -1,0 +1,17 @@
+/target
+/dist
+/.tools
+
+# Sistema e editores
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Artefatos de build empacotados
+*.AppImage
+*.dmg
+*.zip
+
+# Configuração local de toolchain
+.cargo/

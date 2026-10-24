@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Open Transcribe
+Comment=Transcreva aulas e vídeos com Whisper (GPU CUDA)
+Exec=open-transcribe
+Icon=open-transcribe
+Terminal=false
+Categories=AudioVideo;Audio;Video;
+Keywords=whisper;transcricao;transcrição;legendas;
+StartupWMClass=open-transcribe
