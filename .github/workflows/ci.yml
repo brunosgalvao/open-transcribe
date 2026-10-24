@@ -19,9 +19,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            ffmpeg libgtk-3-dev libxkbcommon-dev libwayland-dev \
-            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
-            libgl1-mesa-dev
+            ffmpeg clang libclang-dev libgtk-3-dev libxkbcommon-dev \
+            libwayland-dev libx11-dev libxcursor-dev libxrandr-dev \
+            libxi-dev libgl1-mesa-dev
+      - name: Configurar libclang
+        run: |
+          LIB=$(find /usr/lib -name 'libclang.so' -print -quit)
+          if [ -n "$LIB" ]; then
+            echo "LIBCLANG_PATH=$(dirname "$LIB")" >> "$GITHUB_ENV"
+          fi
       - name: Testes (CPU)
         run: cargo test --release --no-default-features --lib
 
