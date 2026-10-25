@@ -9,6 +9,7 @@ export CUDA_PATH="${CUDA_PATH:-/usr/local/cuda}"
 export CUDAToolkit_ROOT="$CUDA_PATH"
 export CMAKE_CUDA_COMPILER="$CUDA_PATH/bin/nvcc"
 export LIBCLANG_PATH="${LIBCLANG_PATH:-$HOME/.local/lib/clang}"
+export CMAKE_CUDA_ARCHITECTURES="${CMAKE_CUDA_ARCHITECTURES:-75;80;86;89;120}"
 
 NAME="OpenTranscribe"
 APPDIR="$ROOT/dist/$NAME.AppDir"
@@ -26,9 +27,17 @@ OUT="$ROOT/dist/$NAME-$VARIANT-x86_64.AppImage"
 
 echo "[1/5] Compilando (release)..."
 if [[ -n "$FEATURES" ]]; then
-    cargo build --release --features "$FEATURES"
+    cargo build --release --features "$FEATURES" --bin open-transcribe
+    cargo rustc --release --features "$FEATURES" --bin llm-paragraph -- \
+        -C relocation-model=static -C link-arg=-no-pie
+    cargo rustc --release --features "$FEATURES" --bin llm-translate -- \
+        -C relocation-model=static -C link-arg=-no-pie
 else
-    cargo build --release --no-default-features
+    cargo build --release --no-default-features --bin open-transcribe
+    cargo rustc --release --no-default-features --bin llm-paragraph -- \
+        -C relocation-model=static -C link-arg=-no-pie
+    cargo rustc --release --no-default-features --bin llm-translate -- \
+        -C relocation-model=static -C link-arg=-no-pie
 fi
 
 echo "[2/5] Montando AppDir..."
@@ -39,6 +48,7 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib" \
 
 install -m755 target/release/open-transcribe "$APPDIR/usr/bin/open-transcribe"
 install -m755 target/release/llm-paragraph "$APPDIR/usr/bin/llm-paragraph"
+install -m755 target/release/llm-translate "$APPDIR/usr/bin/llm-translate"
 if [[ -n "${FFMPEG_BIN:-}" && -x "$FFMPEG_BIN" ]]; then
     install -m755 "$FFMPEG_BIN" "$APPDIR/usr/bin/ffmpeg"
 fi

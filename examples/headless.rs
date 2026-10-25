@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
-use open_transcribe::config::{Config, OutputMode};
+use open_transcribe::config::{Config, OutputMode, TranslateTarget};
 use open_transcribe::transcribe::{self, Event};
 
 fn main() {
@@ -12,7 +12,11 @@ fn main() {
         std::process::exit(1);
     }
 
-    let mut cfg = Config::default();
+    let mut cfg = if std::env::var("WHISPER_LOAD_CONFIG").as_deref() == Ok("1") {
+        Config::load()
+    } else {
+        Config::default()
+    };
     if let Ok(dir) = std::env::var("WHISPER_OUT") {
         cfg.output_dir = dir;
     }
@@ -25,6 +29,31 @@ fn main() {
             "plain" => OutputMode::Plain,
             _ => OutputMode::Timecode,
         };
+    }
+    if let Ok(model) = std::env::var("WHISPER_MODEL") {
+        cfg.model_path = model;
+    }
+    if let Ok(language) = std::env::var("WHISPER_LANGUAGE") {
+        cfg.language = language;
+    }
+    if let Ok(prompt) = std::env::var("WHISPER_INITIAL_PROMPT") {
+        cfg.initial_prompt = prompt;
+    }
+    if let Ok(value) = std::env::var("WHISPER_BEAM") {
+        if let Ok(beam) = value.parse() {
+            cfg.beam_size = beam;
+        }
+    }
+    if let Ok(value) = std::env::var("WHISPER_VAD") {
+        cfg.vad = value != "0";
+    }
+    if let Ok(value) = std::env::var("WHISPER_FLASH_ATTN") {
+        cfg.flash_attn = value != "0";
+    }
+    if let Ok(value) = std::env::var("WHISPER_VAD_MIN_SILENCE") {
+        if let Ok(ms) = value.parse() {
+            cfg.vad_min_silence_ms = ms;
+        }
     }
     if let Ok(path) = std::env::var("WHISPER_PARAGRAPH_MODEL") {
         cfg.paragraph_model_path = path;
@@ -42,6 +71,14 @@ fn main() {
             cfg.paragraph_max_chars = chars;
         }
     }
+    if let Ok(value) = std::env::var("WHISPER_TRANSLATE_TO") {
+        cfg.translate_to = match value.as_str() {
+            "en" => TranslateTarget::English,
+            "pt" => TranslateTarget::Portuguese,
+            "es" => TranslateTarget::Spanish,
+            _ => TranslateTarget::None,
+        };
+    }
 
     let files: Vec<PathBuf> = args.into_iter().map(PathBuf::from).collect();
     let (tx, rx) = mpsc::channel();
@@ -58,6 +95,11 @@ fn main() {
             }
             Event::Progress { percent, .. } => {
                 print!("\r  {percent}%   ");
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
+            Event::Translating { done, total, .. } => {
+                print!("\r  traduzindo {done}/{total}   ");
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
             }

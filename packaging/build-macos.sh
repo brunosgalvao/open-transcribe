@@ -18,6 +18,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 install -m755 target/release/open-transcribe "$APP/Contents/MacOS/$NAME"
 install -m755 target/release/llm-paragraph "$APP/Contents/MacOS/llm-paragraph"
+install -m755 target/release/llm-translate "$APP/Contents/MacOS/llm-translate"
 if [[ -n "${FFMPEG_BIN:-}" && -x "$FFMPEG_BIN" ]]; then
     install -m755 "$FFMPEG_BIN" "$APP/Contents/MacOS/ffmpeg"
     if command -v dylibbundler >/dev/null 2>&1; then

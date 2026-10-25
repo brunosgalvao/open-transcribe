@@ -37,6 +37,7 @@ enum FileStatus {
     Pending,
     Extracting,
     Transcribing(i32),
+    Translating(i32),
     Done {
         output: PathBuf,
         chunks: usize,
@@ -57,6 +58,7 @@ struct FileItem {
 enum DownloadKind {
     WhisperModel,
     ParagraphModel,
+    TranslationModel,
     Vad,
 }
 
@@ -172,11 +174,21 @@ impl App {
         Path::new(&self.cfg.paragraph_model_path).is_file()
     }
 
+    fn is_translation_model_present(&self) -> bool {
+        Path::new(self.cfg.translation_model()).is_file()
+    }
+
     fn pick_files(&mut self) {
-        let mut dialog = rfd::FileDialog::new().add_filter(
-            "Vídeos",
-            &["mp4", "mkv", "avi", "mov", "m4v"],
-        );
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter(
+                "Vídeos",
+                &[
+                    "mp4", "MP4", "mkv", "MKV", "avi", "AVI", "mov", "MOV",
+                    "m4v", "M4V", "webm", "WEBM", "wmv", "WMV", "ts", "TS",
+                    "m2ts", "M2TS", "mpg", "MPG", "mpeg", "MPEG",
+                ],
+            )
+            .add_filter("Todos os arquivos", &["*"]);
         if Path::new(&self.cfg.videos_dir).is_dir() {
             dialog = dialog.set_directory(&self.cfg.videos_dir);
         }
@@ -238,6 +250,16 @@ impl App {
         }
     }
 
+    fn pick_translation_model_file(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Modelo GGUF", &["gguf"])
+            .set_directory(config::models_dir())
+            .pick_file()
+        {
+            self.cfg.translation_model_path = path.display().to_string();
+        }
+    }
+
     fn pick_output_dir(&mut self) {
         let mut dialog = rfd::FileDialog::new();
         if !self.cfg.output_dir.trim().is_empty()
@@ -291,6 +313,16 @@ impl App {
         if !self.is_model_present() {
             self.log(
                 "ERRO: modelo não encontrado. Escolha ou baixe o modelo em Configurações.",
+            );
+            return;
+        }
+        if self.cfg.translate_to.is_local()
+            && self.cfg.translation_provider == config::TranslationProvider::Local
+            && !self.is_translation_model_present()
+        {
+            self.log(
+                "ERRO: para traduzir para português/espanhol, baixe o modelo de tradução \
+                 em Configurações.",
             );
             return;
         }
@@ -643,7 +675,9 @@ impl App {
                 | FileStatus::Skipped(_)
                 | FileStatus::Failed(_)
                 | FileStatus::Cancelled => 1.0,
-                FileStatus::Transcribing(percent) => (*percent as f32 / 100.0).clamp(0.0, 1.0),
+                FileStatus::Transcribing(percent) | FileStatus::Translating(percent) => {
+                    (*percent as f32 / 100.0).clamp(0.0, 1.0)
+                }
                 _ => 0.0,
             };
         }
@@ -711,6 +745,16 @@ impl App {
                         }
                         self.live_transcript.drain(..cut);
                     }
+                }
+            }
+            Event::Translating { index, done, total } => {
+                if let Some(item) = self.files.get_mut(index) {
+                    let percent = if total > 0 {
+                        (done * 100 / total).clamp(0, 100) as i32
+                    } else {
+                        0
+                    };
+                    item.status = FileStatus::Translating(percent);
                 }
             }
             Event::Progress { index, percent } => {
@@ -797,6 +841,10 @@ impl App {
                     DownloadKind::ParagraphModel => {
                         self.cfg.paragraph_model_path = path.display().to_string();
                         self.log(format!("Modelo de parágrafos selecionado: {}", label));
+                    }
+                    DownloadKind::TranslationModel => {
+                        self.cfg.translation_model_path = path.display().to_string();
+                        self.log(format!("Modelo de tradução selecionado: {}", label));
                     }
                     DownloadKind::Vad => {}
                 }
@@ -1027,6 +1075,9 @@ impl App {
             let mut download_paragraph_model: Option<&'static config::ParagraphModelInfo> =
                 None;
             let mut select_paragraph_model: Option<String> = None;
+            let mut pick_translation_model = false;
+            let mut download_translation_model: Option<&'static config::ParagraphModelInfo> =
+                None;
             let mut download_vad = false;
             let mut reset = false;
             let mut detect_hardware = false;
@@ -1370,11 +1421,208 @@ impl App {
                     });
                     ui.end_row();
 
+                    ui.label("Vocabulário");
+                    ui.vertical(|ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.cfg.initial_prompt)
+                                .desired_width(430.0)
+                                .desired_rows(2)
+                                .hint_text(
+                                    "nomes/termos no idioma do áudio (ex.: 界王, ビルス, 孫悟空)",
+                                ),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "Ajuda o Whisper a acertar nomes próprios. Use o idioma original do áudio.",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                    });
+                    ui.end_row();
+
                     ui.label("Traduzir");
-                    ui.checkbox(
-                        &mut self.cfg.translate,
-                        "Traduzir a fala para inglês",
-                    );
+                    ui.vertical(|ui| {
+                        egui::ComboBox::from_id_salt("translate_to")
+                            .selected_text(self.cfg.translate_to.label())
+                            .width(190.0)
+                            .show_ui(ui, |ui| {
+                                for target in config::TranslateTarget::ALL {
+                                    ui.selectable_value(
+                                        &mut self.cfg.translate_to,
+                                        *target,
+                                        target.label(),
+                                    );
+                                }
+                            });
+                        ui.label(
+                            egui::RichText::new(self.cfg.translate_to.description())
+                                .weak()
+                                .small(),
+                        );
+                        if self.cfg.translate_to.is_local() {
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label("Tradutor:");
+                                egui::ComboBox::from_id_salt("translation_provider")
+                                    .selected_text(
+                                        self.cfg.translation_provider.label(),
+                                    )
+                                    .width(190.0)
+                                    .show_ui(ui, |ui| {
+                                        for provider in
+                                            config::TranslationProvider::ALL
+                                        {
+                                            ui.selectable_value(
+                                                &mut self.cfg.translation_provider,
+                                                *provider,
+                                                provider.label(),
+                                            );
+                                        }
+                                    });
+                            });
+                            ui.label(
+                                egui::RichText::new(
+                                    self.cfg.translation_provider.description(),
+                                )
+                                .weak()
+                                .small(),
+                            );
+                        }
+                        if self.cfg.translate_to.is_local()
+                            && self.cfg.translation_provider
+                                == config::TranslationProvider::Local
+                        {
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label("Modelo:");
+                                let selected_text =
+                                    if self.cfg.translation_model_path.trim().is_empty() {
+                                        "mesmo dos parágrafos".to_string()
+                                    } else {
+                                        config::translation_model_for_path(
+                                            &self.cfg.translation_model_path,
+                                        )
+                                        .or_else(|| {
+                                            config::paragraph_model_for_path(
+                                                &self.cfg.translation_model_path,
+                                            )
+                                        })
+                                        .map(|info| info.name.to_string())
+                                        .unwrap_or_else(|| "personalizado".to_string())
+                                    };
+                                egui::ComboBox::from_id_salt("translation_model")
+                                    .selected_text(selected_text)
+                                    .width(230.0)
+                                    .show_ui(ui, |ui| {
+                                        for info in config::TRANSLATION_MODELS {
+                                            let path = if info.file.is_empty() {
+                                                String::new()
+                                            } else {
+                                                config::translation_model_path(info.file)
+                                                    .display()
+                                                    .to_string()
+                                            };
+                                            ui.selectable_value(
+                                                &mut self.cfg.translation_model_path,
+                                                path,
+                                                info.name,
+                                            );
+                                        }
+                                    });
+                                pick_translation_model =
+                                    ui.button("Escolher…").clicked();
+                            });
+                            let current = self.cfg.translation_model().to_string();
+                            if !Path::new(&current).is_file() {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Modelo de tradução não baixado.",
+                                        )
+                                        .color(egui::Color32::from_rgb(225, 190, 100))
+                                        .small(),
+                                    );
+                                    let recommended =
+                                        if self.cfg.translation_model_path.trim().is_empty() {
+                                            config::TRANSLATION_MODELS
+                                                .iter()
+                                                .find(|info| info.recommended)
+                                        } else {
+                                            config::TRANSLATION_MODELS.iter().find(|info| {
+                                                !info.file.is_empty()
+                                                    && config::translation_model_path(
+                                                        info.file,
+                                                    )
+                                                    .display()
+                                                    .to_string()
+                                                        == current
+                                            })
+                                        };
+                                    if let Some(info) = recommended
+                                        && !info.file.is_empty()
+                                        && ui
+                                            .add_enabled(
+                                                !self.downloading && !self.running,
+                                                egui::Button::new(format!(
+                                                    "Baixar {} ({})",
+                                                    info.name,
+                                                    config::human_size(info.size)
+                                                )),
+                                            )
+                                            .clicked()
+                                    {
+                                        download_translation_model = Some(info);
+                                    }
+                                });
+                            } else if let Some(info) = config::TRANSLATION_MODELS
+                                .iter()
+                                .find(|info| info.recommended)
+                            {
+                                let recommended =
+                                    config::translation_model_path(info.file);
+                                if recommended.is_file() {
+                                    if self.cfg.translation_model_path
+                                        != recommended.display().to_string()
+                                    {
+                                        if ui.button("Usar Qwen 3B").clicked() {
+                                            self.cfg.translation_model_path =
+                                                recommended.display().to_string();
+                                        }
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new("Qwen 3B em uso.")
+                                                .weak()
+                                                .small(),
+                                        );
+                                    }
+                                } else if ui
+                                    .add_enabled(
+                                        !self.downloading && !self.running,
+                                        egui::Button::new(format!(
+                                            "Baixar Qwen 3B (recomendado, {})",
+                                            config::human_size(info.size)
+                                        )),
+                                    )
+                                    .clicked()
+                                {
+                                    download_translation_model = Some(info);
+                                }
+                            }
+                        }
+                        if self.cfg.translate_to.is_local()
+                            && self.cfg.translation_provider
+                                == config::TranslationProvider::Google
+                        {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Online: os trechos são enviados ao Google Tradutor.",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                        }
+                    });
                     ui.end_row();
 
                     ui.label("Precisão");
@@ -1403,7 +1651,8 @@ impl App {
                         );
                         ui.checkbox(&mut self.cfg.flash_attn, "Flash attention")
                             .on_hover_text(
-                                "Acelera bastante, mas pode alterar levemente o resultado.",
+                                "Acelera, mas pode truncar ou repetir áudios longos. \
+                                 Deixe desligado para maior estabilidade.",
                             );
                     });
                     ui.end_row();
@@ -1853,6 +2102,9 @@ impl App {
             if pick_paragraph_model {
                 self.pick_paragraph_model_file();
             }
+            if pick_translation_model {
+                self.pick_translation_model_file();
+            }
             if pick_output {
                 self.pick_output_dir();
             }
@@ -1876,6 +2128,14 @@ impl App {
                     config::paragraph_model_url(info.file),
                     config::paragraph_model_path(info.file),
                     DownloadKind::ParagraphModel,
+                );
+            }
+            if let Some(info) = download_translation_model {
+                self.start_download(
+                    info.name,
+                    config::translation_model_url(info.file),
+                    config::translation_model_path(info.file),
+                    DownloadKind::TranslationModel,
                 );
             }
             if download_vad {
@@ -2157,6 +2417,7 @@ fn status_label(status: &FileStatus) -> (String, egui::Color32) {
         FileStatus::Pending => ("na fila".to_string(), gray),
         FileStatus::Extracting => ("extraindo áudio...".to_string(), yellow),
         FileStatus::Transcribing(percent) => (format!("transcrevendo {percent}%"), blue),
+        FileStatus::Translating(percent) => (format!("traduzindo {percent}%"), blue),
         FileStatus::Done {
             chunks, duration, ..
         } => (

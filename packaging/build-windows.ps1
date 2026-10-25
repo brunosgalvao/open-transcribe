@@ -31,6 +31,7 @@ Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $Stage | Out-Null
 Copy-Item "target\release\open-transcribe.exe" (Join-Path $Stage "$Name.exe")
 Copy-Item "target\release\llm-paragraph.exe" (Join-Path $Stage "llm-paragraph.exe")
+Copy-Item "target\release\llm-translate.exe" (Join-Path $Stage "llm-translate.exe")
 Copy-Item "assets\icon.png" (Join-Path $Stage "icon.png")
 
 $ffmpeg = $env:FFMPEG_BIN

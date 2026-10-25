@@ -13,10 +13,19 @@
 - Transcrição local com Whisper (GPU CUDA, Metal ou CPU).
 - Visualização da transcrição em tempo real durante o processamento.
 - Texto corrido com parágrafos separados por pausas, pontuação, conteúdo e um LLM local opcional.
+- Tradução para inglês pelo Whisper ou para português (Brasil)/espanhol com Google Tradutor online ou IA local.
 - Detecção de hardware com configuração recomendada para o computador.
 - Download e remoção de modelos pela própria interface.
 - Verificação de atualizações pelo GitHub, com atualização automática do AppImage no Linux.
 - Saídas em texto com timecodes, texto corrido ou legendas SRT.
+
+## Tradução
+
+- **Inglês:** usa a tradução nativa do Whisper.
+- **Português (Brasil) e espanhol:** por padrão usa o **Google Tradutor online**, que dá a melhor qualidade. Também é possível escolher **IA local (Qwen)** em Configurações.
+- O português é sempre pt-BR.
+
+A tradução online envia apenas os trechos da transcrição para o Google. Se quiser tudo offline, selecione **IA local (Qwen)**; nesse caso o Qwen 2.5 3B é o mínimo recomendado.
 
 ## Download
 
@@ -85,7 +94,7 @@ O script gera o `.app` e o `.dmg` com Metal habilitado.
 O workflow `.github/workflows/release.yml` gera os pacotes de Linux, Windows e macOS quando uma tag `v*` é enviada:
 
 ```bash
-git tag v0.1.0
+git tag v0.1.1
 git push origin v0.1.0
 ```
 

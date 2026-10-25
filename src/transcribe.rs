@@ -1,4 +1,4 @@
-use crate::config::{self, Config, OutputMode};
+use crate::config::{self, Config, OutputMode, TranslateTarget, TranslationProvider};
 use crate::platform;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -6,12 +6,13 @@ use std::collections::BTreeSet;
 #[cfg(feature = "cuda")]
 use std::ffi::c_void;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::time::Duration;
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperVadParams,
 };
@@ -34,6 +35,11 @@ pub enum Event {
     Partial {
         index: usize,
         text: String,
+    },
+    Translating {
+        index: usize,
+        done: usize,
+        total: usize,
     },
     Skipped {
         index: usize,
@@ -300,48 +306,109 @@ fn transcribe_file(
         return Ok(());
     }
 
-    let mut params = FullParams::new(match cfg.beam_size.max(1) {
-        1 => SamplingStrategy::Greedy { best_of: 1 },
-        n => SamplingStrategy::BeamSearch {
-            beam_size: n,
-            patience: -1.0,
-        },
-    });
-
     let language = cfg.language.trim();
-    if language.is_empty() || language.eq_ignore_ascii_case("auto") {
-        params.set_language(None);
-        params.set_detect_language(true);
+    let auto_language = language.is_empty() || language.eq_ignore_ascii_case("auto");
+    let language_code = if auto_language {
+        match detect_language(ctx, &pcm, cfg.threads.clamp(1, 64)) {
+            Some(code) => {
+                send(tx, Event::Log(format!("Idioma detectado: {code}.")));
+                Some(code)
+            }
+            None => None,
+        }
     } else {
-        params.set_language(Some(language));
-    }
+        Some(language)
+    };
 
-    params.set_n_threads(cfg.threads.clamp(1, 64));
-    params.set_translate(cfg.translate);
-    params.set_print_special(false);
-    params.set_print_progress(false);
-    params.set_print_realtime(false);
-    params.set_print_timestamps(false);
-    params.set_no_timestamps(false);
+    let target = cfg.translate_to;
+    let target_code = target.code();
+    let total_samples = pcm.len();
+    let chunk_samples = 300 * 16_000;
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut offset_samples = (90 * 16_000).min(total_samples);
+    let mut chunk_index = 0usize;
 
-    if vad_available {
-        params.set_vad_model_path(Some(&cfg.vad_model_path));
-        let mut vad_params = WhisperVadParams::default();
-        vad_params.set_threshold(0.5);
-        vad_params.set_min_silence_duration(cfg.vad_min_silence_ms.clamp(0, 60_000));
-        params.set_vad_params(vad_params);
-        params.enable_vad(true);
-    }
+    while offset_samples < total_samples {
+        let size = chunk_samples.min(total_samples - offset_samples);
+        let chunk = &pcm[offset_samples..offset_samples + size];
+        if cancel.load(Ordering::Relaxed) {
+            send(tx, Event::Cancelled { index });
+            return Ok(());
+        }
+        let offset_seconds = offset_samples as f64 / 16_000.0;
 
-    let progress_tx = tx.clone();
-    params.set_progress_callback_safe(move |percent: i32| {
-        send(&progress_tx, Event::Progress { index, percent });
-    });
+        let mut params = FullParams::new(match cfg.beam_size.max(1) {
+            1 => SamplingStrategy::Greedy { best_of: 1 },
+            n => SamplingStrategy::BeamSearch {
+                beam_size: n,
+                patience: -1.0,
+            },
+        });
 
-    let segment_tx = tx.clone();
-    params.set_segment_callback_safe(move |data: whisper_rs::SegmentCallbackData| {
-        let text = data.text.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !text.is_empty() {
+        if let Some(code) = language_code {
+            params.set_language(Some(code));
+            params.set_detect_language(false);
+        } else {
+            params.set_language(None);
+            params.set_detect_language(true);
+        }
+
+        let initial_prompt = cfg.initial_prompt.trim();
+        if !initial_prompt.is_empty() {
+            params.set_initial_prompt(initial_prompt);
+        }
+        if cfg.output_mode == OutputMode::Srt {
+            params.set_max_len(80);
+            params.set_split_on_word(true);
+        }
+        params.set_n_threads(cfg.threads.clamp(1, 64));
+        params.set_no_context(true);
+        params.set_suppress_nst(true);
+        params.set_entropy_thold(2.0);
+        params.set_translate(target == TranslateTarget::English);
+        params.set_print_special(false);
+        params.set_print_progress(false);
+        params.set_print_realtime(false);
+        params.set_print_timestamps(false);
+        params.set_no_timestamps(false);
+
+        if vad_available {
+            params.set_vad_model_path(Some(&cfg.vad_model_path));
+            let mut vad_params = WhisperVadParams::default();
+            vad_params.set_threshold(0.5);
+            vad_params.set_min_silence_duration(cfg.vad_min_silence_ms.clamp(0, 60_000));
+            params.set_vad_params(vad_params);
+            params.enable_vad(true);
+        }
+
+        let progress_tx = tx.clone();
+        let chunk_len = chunk.len();
+        let base_samples = offset_samples;
+        let total = total_samples.max(1);
+        params.set_progress_callback_safe(move |percent: i32| {
+            let overall = ((base_samples as f64
+                + (percent as f64 / 100.0) * chunk_len as f64)
+                / total as f64
+                * 100.0)
+                .clamp(0.0, 100.0) as i32;
+            send(
+                &progress_tx,
+                Event::Progress {
+                    index,
+                    percent: overall,
+                },
+            );
+        });
+
+        let segment_tx = tx.clone();
+        let mut last_preview = String::new();
+        params.set_segment_callback_safe(move |data: whisper_rs::SegmentCallbackData| {
+            let text = data.text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let key = text.trim().to_lowercase();
+            if text.is_empty() || key == last_preview.trim().to_lowercase() {
+                return;
+            }
+            last_preview = text.clone();
             send(
                 &segment_tx,
                 Event::Partial {
@@ -349,22 +416,40 @@ fn transcribe_file(
                     text,
                 },
             );
+        });
+
+        let abort_cancel = cancel.clone();
+        params.set_abort_callback_safe(move || abort_cancel.load(Ordering::Relaxed));
+
+        let mut state = ctx
+            .create_state()
+            .map_err(|e| anyhow!("falha ao criar o estado do Whisper: {e}"))?;
+
+        if let Err(err) = state.full(params, chunk) {
+            if cancel.load(Ordering::Relaxed) {
+                send(tx, Event::Cancelled { index });
+                return Ok(());
+            }
+            send(
+                tx,
+                Event::Log(format!(
+                    "Aviso: falha no trecho {} da transcrição ({err}); seguindo para o próximo.",
+                    chunk_index + 1
+                )),
+            );
+            offset_samples += size;
+            chunk_index += 1;
+            continue;
         }
-    });
 
-    let abort_cancel = cancel.clone();
-    params.set_abort_callback_safe(move || abort_cancel.load(Ordering::Relaxed));
-
-    let mut state = ctx
-        .create_state()
-        .map_err(|e| anyhow!("falha ao criar o estado do Whisper: {e}"))?;
-
-    if let Err(err) = state.full(params, &pcm) {
-        if cancel.load(Ordering::Relaxed) {
-            send(tx, Event::Cancelled { index });
-            return Ok(());
+        let mut chunk_segments = collect_segments(&state);
+        for segment in &mut chunk_segments {
+            segment.start += offset_seconds;
+            segment.end += offset_seconds;
         }
-        return Err(anyhow!("falha na transcrição: {err}"));
+        segments.extend(chunk_segments);
+        offset_samples += size;
+        chunk_index += 1;
     }
 
     if cancel.load(Ordering::Relaxed) {
@@ -372,24 +457,120 @@ fn transcribe_file(
         return Ok(());
     }
 
-    let segments = collect_segments(&state);
+    let needs_translation = target.is_local() && language_code != target_code;
+    if target.is_local() && !needs_translation {
+        send(
+            tx,
+            Event::Log(format!(
+                "Idioma detectado já é {}; tradução ignorada.",
+                target.language_name()
+            )),
+        );
+    }
+    let translation_source = language_code;
+
+    let removed = collapse_repetitions(&mut segments);
+    if removed > 0 {
+        send(
+            tx,
+            Event::Log(format!(
+                "Aviso: repetição detectada; {removed} trecho(s) repetido(s) removido(s)."
+            )),
+        );
+    }
+    if segments.is_empty() {
+        send(
+            tx,
+            Event::Log(
+                "Aviso: nenhum trecho transcrito. Verifique se o áudio tem fala ou \
+                 selecione o idioma manualmente."
+                    .to_string(),
+            ),
+        );
+    }
     let chunks = match cfg.output_mode {
         OutputMode::Srt => {
+            if needs_translation {
+                if let Err(err) = translate_segments(
+                    &mut segments,
+                    target,
+                    translation_source,
+                    index,
+                    cancel,
+                    cfg,
+                    tx,
+                ) {
+                    if cancel.load(Ordering::Relaxed) {
+                        send(tx, Event::Cancelled { index });
+                        return Ok(());
+                    }
+                    send(
+                        tx,
+                        Event::Log(format!(
+                            "Aviso: tradução indisponível ({err:#}); mantendo o texto original."
+                        )),
+                    );
+                }
+            }
             let cues = build_subtitles(&segments, cfg);
             write_srt(&output, &cues, cfg)?;
             cues.len()
         }
         OutputMode::Plain => {
-            let chunks = build_plain_paragraphs(&segments, cfg, tx);
+            let mut chunks = build_plain_paragraphs(&segments, cfg, tx);
             if cancel.load(Ordering::Relaxed) {
                 send(tx, Event::Cancelled { index });
                 return Ok(());
+            }
+            if needs_translation {
+                if let Err(err) = translate_chunks(
+                    &mut chunks,
+                    target,
+                    translation_source,
+                    index,
+                    cancel,
+                    cfg,
+                    tx,
+                ) {
+                    if cancel.load(Ordering::Relaxed) {
+                        send(tx, Event::Cancelled { index });
+                        return Ok(());
+                    }
+                    send(
+                        tx,
+                        Event::Log(format!(
+                            "Aviso: tradução indisponível ({err:#}); mantendo o texto original."
+                        )),
+                    );
+                }
             }
             write_plain(&output, &chunks)?;
             chunks.len()
         }
         OutputMode::Timecode => {
-            let chunks = group_segments(&segments, cfg.chunk_seconds.max(1.0));
+            let mut chunks = group_segments(&segments, cfg.chunk_seconds.max(1.0));
+            if needs_translation {
+                if let Err(err) = translate_chunks(
+                    &mut chunks,
+                    target,
+                    translation_source,
+                    index,
+                    cancel,
+                    cfg,
+                    tx,
+                ) {
+                    if cancel.load(Ordering::Relaxed) {
+                        send(tx, Event::Cancelled { index });
+                        return Ok(());
+                    }
+                    send(
+                        tx,
+                        Event::Log(format!(
+                            "Aviso: tradução indisponível ({err:#}); mantendo o texto original."
+                        )),
+                    );
+                }
+            }
             write_timecode(&output, &final_name, file, &chunks)?;
             chunks.len()
         }
@@ -439,6 +620,97 @@ fn collect_segments(state: &whisper_rs::WhisperState) -> Vec<Segment> {
         segments.push(Segment { start, end, text });
     }
     segments
+}
+
+fn collapse_repetitions(segments: &mut Vec<Segment>) -> usize {
+    let mut removed = 0usize;
+
+    for segment in segments.iter_mut() {
+        let pieces = sentence_pieces(&segment.text);
+        if pieces.len() <= 1 {
+            continue;
+        }
+        let piece_count = pieces.len();
+        let mut collapsed: Vec<String> = Vec::new();
+        let mut last: Option<String> = None;
+        for piece in pieces {
+            let key = piece.trim().to_lowercase();
+            if last.as_deref() == Some(key.as_str()) {
+                removed += 1;
+                continue;
+            }
+            last = Some(key);
+            collapsed.push(piece);
+        }
+        if collapsed.len() < piece_count {
+            segment.text = collapsed.join(" ");
+        }
+    }
+
+    let mut deduped: Vec<Segment> = Vec::new();
+    let mut last: Option<String> = None;
+    for segment in segments.drain(..) {
+        let key = segment.text.trim().to_lowercase();
+        if last.as_deref() == Some(key.as_str()) {
+            removed += 1;
+            continue;
+        }
+        last = Some(key);
+        deduped.push(segment);
+    }
+    *segments = deduped;
+    removed
+}
+
+fn detect_language(
+    ctx: &WhisperContext,
+    pcm: &[f32],
+    threads: i32,
+) -> Option<&'static str> {
+    let threads = threads.clamp(1, 64) as usize;
+    let window = 30 * 16_000;
+    let total = pcm.len();
+    let mut offsets = vec![0usize];
+    if total > window {
+        offsets.push((total / 2).saturating_sub(window / 2));
+        offsets.push(total - window);
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+
+    let mut votes: Vec<(&'static str, f32)> = Vec::new();
+    for offset in offsets {
+        let start = offset.min(total);
+        let end = (start + window).min(total);
+        if end.saturating_sub(start) < 5 * 16_000 {
+            continue;
+        }
+        let mut state = ctx.create_state().ok()?;
+        state.pcm_to_mel(&pcm[start..end], threads).ok()?;
+        let (language_id, probabilities) = state.lang_detect(0, threads).ok()?;
+        let Some(language) = whisper_rs::get_lang_str(language_id) else {
+            continue;
+        };
+        let probability = probabilities
+            .get(language_id as usize)
+            .copied()
+            .unwrap_or(0.0)
+            .max(0.01);
+        votes.push((language, probability));
+    }
+
+    let mut best: Option<(&'static str, f32)> = None;
+    for (language, _) in &votes {
+        let score: f32 = votes
+            .iter()
+            .filter(|(candidate, _)| candidate == language)
+            .map(|(_, probability)| probability)
+            .sum();
+        if best.is_none_or(|(_, best_score)| score > best_score) {
+            best = Some((language, score));
+        }
+    }
+    best.map(|(language, _)| language)
 }
 
 fn group_segments(segments: &[Segment], chunk_seconds: f64) -> Vec<Chunk> {
@@ -557,12 +829,13 @@ fn sentence_pieces(text: &str) -> Vec<String> {
 
     for (index, ch) in chars.iter().enumerate() {
         current.push(*ch);
-        if !matches!(ch, '.' | '!' | '?') {
+        if !matches!(ch, '.' | '!' | '?' | '。' | '！' | '？') {
             continue;
         }
 
         let next = chars.get(index + 1);
-        if next.is_some_and(|c| !c.is_whitespace()) {
+        let strong = matches!(ch, '!' | '?' | '。' | '！' | '？');
+        if !strong && next.is_some_and(|c| !c.is_whitespace()) {
             continue;
         }
         let previous = index.checked_sub(1).and_then(|i| chars.get(i));
@@ -595,7 +868,7 @@ fn ends_sentence(text: &str) -> bool {
     }
     text.chars()
         .last()
-        .is_some_and(|c| matches!(c, '.' | '!' | '?'))
+        .is_some_and(|c| matches!(c, '.' | '!' | '?' | '。' | '！' | '？'))
 }
 
 const COHESION_WINDOW: usize = 3;
@@ -894,6 +1167,330 @@ fn starts_new_topic(text: &str) -> bool {
     MARKERS.iter().any(|marker| lower.starts_with(marker))
 }
 
+fn translate_google(
+    texts: &mut [String],
+    target_code: &str,
+    source: Option<&str>,
+    index: usize,
+    cancel: &Arc<AtomicBool>,
+    tx: &Sender<Event>,
+) -> Result<()> {
+    let total = texts.len();
+    let source_code = source.unwrap_or("auto");
+    send(
+        tx,
+        Event::Log(format!(
+            "Traduzindo {total} trecho(s) com o Google Tradutor..."
+        )),
+    );
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("open-transcribe/0.1")
+        .timeout(Duration::from_secs(20))
+        .build()
+        .context("não foi possível criar o cliente HTTP")?;
+
+    let mut failures = 0usize;
+    for (position, text) in texts.iter_mut().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("tradução cancelada");
+        }
+        if !text.trim().is_empty() {
+            match google_translate_text(&client, text, source_code, target_code) {
+                Ok(translated) => *text = translated,
+                Err(err) => {
+                    failures += 1;
+                    send(
+                        tx,
+                        Event::Log(format!(
+                            "Aviso: falha ao traduzir o trecho {}: {err:#}",
+                            position + 1
+                        )),
+                    );
+                }
+            }
+        }
+        send(
+            tx,
+            Event::Translating {
+                index,
+                done: position + 1,
+                total,
+            },
+        );
+        std::thread::sleep(Duration::from_millis(120));
+    }
+
+    if cancel.load(Ordering::Relaxed) {
+        bail!("tradução cancelada");
+    }
+    if failures > 0 {
+        send(
+            tx,
+            Event::Log(format!(
+                "Tradução online concluída com {failures} trecho(s) sem tradução."
+            )),
+        );
+    } else {
+        send(tx, Event::Log("Tradução online concluída.".to_string()));
+    }
+    Ok(())
+}
+
+fn google_translate_text(
+    client: &reqwest::blocking::Client,
+    text: &str,
+    source: &str,
+    target: &str,
+) -> Result<String> {
+    let mut last_error = None;
+    for attempt in 0..3u64 {
+        let mut url = reqwest::Url::parse(
+            "https://translate.googleapis.com/translate_a/single",
+        )
+        .context("URL do Google inválida")?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair("client", "gtx");
+            pairs.append_pair("sl", source);
+            pairs.append_pair("tl", target);
+            pairs.append_pair("dt", "t");
+            pairs.append_pair("q", text);
+        }
+        let response = client.get(url).send();
+        match response {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    let value: serde_json::Value = response
+                        .json()
+                        .context("resposta inválida do Google")?;
+                    let mut translated = String::new();
+                    if let Some(parts) = value.get(0).and_then(|value| value.as_array()) {
+                        for part in parts {
+                            if let Some(piece) = part.get(0).and_then(|value| value.as_str()) {
+                                translated.push_str(piece);
+                            }
+                        }
+                    }
+                    let translated = translated.trim();
+                    if !translated.is_empty() {
+                        return Ok(translated.to_string());
+                    }
+                    last_error = Some(anyhow!("o Google retornou uma tradução vazia"));
+                } else {
+                    last_error = Some(anyhow!("o Google retornou HTTP {status}"));
+                }
+            }
+            Err(err) => last_error = Some(anyhow!(err)),
+        }
+        std::thread::sleep(Duration::from_millis(500 * (attempt + 1)));
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("falha na tradução online")))
+}
+
+#[derive(Deserialize)]
+struct TranslationResponse {
+    #[serde(default)]
+    translations: Vec<String>,
+}
+
+fn translate_chunks(
+    chunks: &mut [Chunk],
+    target: TranslateTarget,
+    source: Option<&str>,
+    index: usize,
+    cancel: &Arc<AtomicBool>,
+    cfg: &Config,
+    tx: &Sender<Event>,
+) -> Result<()> {
+    let mut texts: Vec<String> = chunks.iter().map(|chunk| chunk.text.clone()).collect();
+    translate_texts(&mut texts, target, source, index, cancel, cfg, tx)?;
+    for (chunk, text) in chunks.iter_mut().zip(texts) {
+        chunk.text = text;
+    }
+    Ok(())
+}
+
+fn translate_segments(
+    segments: &mut [Segment],
+    target: TranslateTarget,
+    source: Option<&str>,
+    index: usize,
+    cancel: &Arc<AtomicBool>,
+    cfg: &Config,
+    tx: &Sender<Event>,
+) -> Result<()> {
+    let mut texts: Vec<String> = segments
+        .iter()
+        .map(|segment| segment.text.clone())
+        .collect();
+    translate_texts(&mut texts, target, source, index, cancel, cfg, tx)?;
+    for (segment, text) in segments.iter_mut().zip(texts) {
+        segment.text = text;
+    }
+    Ok(())
+}
+
+fn translate_texts(
+    texts: &mut [String],
+    target: TranslateTarget,
+    source: Option<&str>,
+    index: usize,
+    cancel: &Arc<AtomicBool>,
+    cfg: &Config,
+    tx: &Sender<Event>,
+) -> Result<()> {
+    if texts.is_empty() {
+        return Ok(());
+    }
+    if !target.is_local() {
+        return Ok(());
+    }
+    let target_code = target.code().context("destino de tradução inválido")?;
+    if cfg.translation_provider == TranslationProvider::Google {
+        return translate_google(texts, target_code, source, index, cancel, tx);
+    }
+    let model = Path::new(cfg.translation_model());
+    if !model.is_file() {
+        bail!(
+            "modelo de tradução não encontrado em {}",
+            model.display()
+        );
+    }
+
+    send(
+        tx,
+        Event::Log(format!(
+            "Traduzindo {} trecho(s) para {} com o modelo local (pode demorar)...",
+            texts.len(),
+            target.language_name()
+        )),
+    );
+
+    let pivot = if target.is_local()
+        && source.is_some()
+        && source != target.code()
+        && !matches!(source, Some("en") | Some("pt") | Some("es"))
+    {
+        Some("en")
+    } else {
+        None
+    };
+    let request = serde_json::json!({
+        "texts": texts,
+        "target": target_code,
+        "source": source,
+        "pivot": pivot,
+        "threads": cfg.threads.clamp(1, 32),
+    });
+    let helper = translate_helper_path();
+    let mut child = Command::new(&helper)
+        .arg("--model")
+        .arg(model)
+        .arg("--input")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("não foi possível executar {}", helper.display()))?;
+
+    {
+        let mut stdin = child.stdin.take().context("llm-translate sem stdin")?;
+        stdin
+            .write_all(request.to_string().as_bytes())
+            .context("falha ao enviar o texto para o llm-translate")?;
+    }
+
+    let stdout = child.stdout.take().context("llm-translate sem stdout")?;
+    let stderr = child.stderr.take().context("llm-translate sem stderr")?;
+
+    let stdout_handle = std::thread::spawn(move || -> std::io::Result<String> {
+        let mut reader = BufReader::new(stdout);
+        let mut text = String::new();
+        reader.read_to_string(&mut text)?;
+        Ok(text)
+    });
+
+    let progress_tx = tx.clone();
+    let stderr_handle = std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        let mut errors = String::new();
+        for line in reader.lines().map_while(Result::ok) {
+            if let Some(rest) = line.strip_prefix("progress ") {
+                let mut parts = rest.split_whitespace();
+                let done = parts.next().and_then(|value| value.parse::<usize>().ok());
+                let total = parts.next().and_then(|value| value.parse::<usize>().ok());
+                if let (Some(done), Some(total)) = (done, total) {
+                    send(
+                        &progress_tx,
+                        Event::Translating { index, done, total },
+                    );
+                }
+            } else if !line.trim().is_empty() {
+                errors.push_str(&line);
+                errors.push('\n');
+            }
+        }
+        errors
+    });
+
+    let mut cancelled = false;
+    let mut status = None;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            cancelled = true;
+            break;
+        }
+        match child.try_wait().context("erro aguardando o llm-translate")? {
+            Some(exit) => {
+                status = Some(exit);
+                break;
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+
+    let stdout_text = stdout_handle
+        .join()
+        .unwrap_or_else(|_| Ok(String::new()))
+        .context("erro lendo a saída do llm-translate")?;
+    let stderr_text = stderr_handle.join().unwrap_or_default();
+
+    if cancelled {
+        bail!("tradução cancelada");
+    }
+    if let Some(exit) = status {
+        if !exit.success() {
+            let reason = stderr_text
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("erro desconhecido");
+            bail!("llm-translate falhou: {}", reason.trim());
+        }
+    }
+
+    let response: TranslationResponse =
+        serde_json::from_str(&stdout_text).context("resposta inválida do llm-translate")?;
+    if response.translations.len() != texts.len() {
+        bail!(
+            "llm-translate devolveu {} traduções para {} trechos",
+            response.translations.len(),
+            texts.len()
+        );
+    }
+    for (slot, translation) in texts.iter_mut().zip(response.translations) {
+        if !translation.trim().is_empty() {
+            *slot = translation;
+        }
+    }
+    send(tx, Event::Log("Tradução concluída.".to_string()));
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct ParagraphResponse {
     #[serde(default)]
@@ -975,14 +1572,22 @@ fn ai_paragraph_breaks(segments: &[Segment], cfg: &Config) -> Result<BTreeSet<us
 }
 
 fn paragraph_helper_path() -> PathBuf {
-    let names: &[&str] = if cfg!(target_os = "windows") {
-        &["llm-paragraph.exe", "llm-paragraph"]
+    helper_path("llm-paragraph")
+}
+
+fn translate_helper_path() -> PathBuf {
+    helper_path("llm-translate")
+}
+
+fn helper_path(base: &str) -> PathBuf {
+    let names: Vec<String> = if cfg!(target_os = "windows") {
+        vec![format!("{base}.exe"), base.to_string()]
     } else {
-        &["llm-paragraph"]
+        vec![base.to_string()]
     };
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            for name in names {
+            for name in &names {
                 for candidate in [dir.join(name), dir.join("..").join(name)] {
                     if candidate.is_file() {
                         return candidate;
@@ -991,7 +1596,7 @@ fn paragraph_helper_path() -> PathBuf {
             }
         }
     }
-    PathBuf::from(names[0])
+    PathBuf::from(&names[0])
 }
 
 fn build_subtitles(segments: &[Segment], cfg: &Config) -> Vec<Cue> {
@@ -1333,6 +1938,41 @@ mod tests {
             sentence_pieces("São 5.5 milhões. Fim"),
             vec!["São 5.5 milhões.", "Fim"]
         );
+    }
+
+    #[test]
+    fn splits_japanese_questions_without_spaces() {
+        assert_eq!(
+            sentence_pieces("お父さんのことを知っているのか?お父さんのことを知っているのか?"),
+            vec!["お父さんのことを知っているのか?", "お父さんのことを知っているのか?"]
+        );
+        assert!(ends_sentence("お父さんのことを知っているのか？"));
+    }
+
+    #[test]
+    fn collapses_repeated_segments() {
+        let mut segments = vec![
+            segment(0.0, 1.0, "a?"),
+            segment(1.0, 2.0, "a?"),
+            segment(2.0, 3.0, "b?"),
+        ];
+        let removed = collapse_repetitions(&mut segments);
+        assert_eq!(removed, 1);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].text, "a?");
+        assert_eq!(segments[1].text, "b?");
+    }
+
+    #[test]
+    fn collapses_repetition_inside_segment() {
+        let mut segments = vec![segment(
+            0.0,
+            3.0,
+            "お父さんのことを知っているのか?お父さんのことを知っているのか?お父さんのことを知っているのか?",
+        )];
+        let removed = collapse_repetitions(&mut segments);
+        assert_eq!(removed, 2);
+        assert_eq!(segments[0].text, "お父さんのことを知っているのか?");
     }
 
     #[test]

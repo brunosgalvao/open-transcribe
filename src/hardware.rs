@@ -180,8 +180,8 @@ impl HardwareInfo {
         config.model_path = config::model_path(info.file).display().to_string();
         config.use_gpu = use_gpu;
         config.threads = threads as i32;
-        config.beam_size = 1;
-        config.flash_attn = use_gpu;
+        config.beam_size = 5;
+        config.flash_attn = false;
         config.paragraph_model_path = config::paragraph_model_path(paragraph_model.file)
             .display()
             .to_string();

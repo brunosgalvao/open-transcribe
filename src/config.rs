@@ -138,6 +138,43 @@ pub const PARAGRAPH_MODELS: &[ParagraphModelInfo] = &[
     },
 ];
 
+pub const TRANSLATION_MODELS: &[ParagraphModelInfo] = &[
+    ParagraphModelInfo {
+        name: "Mesmo modelo dos parágrafos",
+        file: "",
+        size: 0,
+        description: "Usa o modelo escolhido na seção de parágrafos. O Qwen 1.5B é o mínimo.",
+        recommended: false,
+    },
+    ParagraphModelInfo {
+        name: "Qwen2.5 3B (recomendado para tradução)",
+        file: "qwen2.5-3b-instruct-q4_k_m.gguf",
+        size: 2_104_932_768,
+        description: "Tradução bem melhor que o 1.5B. Download ~2 GB, roda na CPU ou GPU conforme o build.",
+        recommended: true,
+    },
+];
+
+pub fn translation_model_url(file: &str) -> String {
+    let repo = if file.contains("3b") {
+        "Qwen/Qwen2.5-3B-Instruct-GGUF"
+    } else {
+        "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
+    };
+    format!("https://huggingface.co/{repo}/resolve/main/{file}")
+}
+
+pub fn translation_model_path(file: &str) -> PathBuf {
+    models_dir().join(file)
+}
+
+pub fn translation_model_for_path(path: &str) -> Option<&'static ParagraphModelInfo> {
+    TRANSLATION_MODELS
+        .iter()
+        .filter(|info| !info.file.is_empty())
+        .find(|info| translation_model_path(info.file).as_path() == Path::new(path))
+}
+
 pub fn paragraph_model_url(file: &str) -> String {
     let repo = if file.contains("1.5b") {
         "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
@@ -158,7 +195,9 @@ pub fn paragraph_model_for_path(path: &str) -> Option<&'static ParagraphModelInf
         .find(|info| paragraph_model_path(info.file).as_path() == path)
 }
 
-pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "avi", "mov", "m4v"];
+pub const VIDEO_EXTENSIONS: &[&str] = &[
+    "mp4", "mkv", "avi", "mov", "m4v", "webm", "wmv", "ts", "m2ts", "mpg", "mpeg",
+];
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -198,6 +237,105 @@ impl OutputMode {
             OutputMode::Timecode | OutputMode::Plain => "txt",
             OutputMode::Srt => "srt",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TranslateTarget {
+    #[default]
+    None,
+    English,
+    Portuguese,
+    Spanish,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TranslationProvider {
+    #[default]
+    Google,
+    Local,
+}
+
+impl TranslationProvider {
+    pub const ALL: &'static [TranslationProvider] =
+        &[TranslationProvider::Google, TranslationProvider::Local];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TranslationProvider::Google => "Google (online)",
+            TranslationProvider::Local => "IA local (Qwen)",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            TranslationProvider::Google => {
+                "Envia os trechos para o Google Tradutor. Melhor qualidade, requer internet."
+            }
+            TranslationProvider::Local => {
+                "Traduz offline com o modelo Qwen local. Não envia nada para a internet."
+            }
+        }
+    }
+}
+
+impl TranslateTarget {
+    pub const ALL: &'static [TranslateTarget] = &[
+        TranslateTarget::None,
+        TranslateTarget::English,
+        TranslateTarget::Portuguese,
+        TranslateTarget::Spanish,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TranslateTarget::None => "Não traduzir",
+            TranslateTarget::English => "Inglês",
+            TranslateTarget::Portuguese => "Português (Brasil)",
+            TranslateTarget::Spanish => "Espanhol",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            TranslateTarget::None => "Mantém o idioma original da fala.",
+            TranslateTarget::English => {
+                "Tradução nativa do Whisper para inglês, rápida e sem modelo extra."
+            }
+            TranslateTarget::Portuguese => {
+                "Traduz para português brasileiro (pt-BR) com o tradutor escolhido."
+            }
+            TranslateTarget::Spanish => {
+                "Traduz para espanhol com o tradutor escolhido."
+            }
+        }
+    }
+
+    pub fn code(self) -> Option<&'static str> {
+        match self {
+            TranslateTarget::None => None,
+            TranslateTarget::English => Some("en"),
+            TranslateTarget::Portuguese => Some("pt"),
+            TranslateTarget::Spanish => Some("es"),
+        }
+    }
+
+    pub fn language_name(self) -> &'static str {
+        match self {
+            TranslateTarget::None => "",
+            TranslateTarget::English => "inglês",
+            TranslateTarget::Portuguese => "português brasileiro",
+            TranslateTarget::Spanish => "espanhol",
+        }
+    }
+
+    pub fn is_local(self) -> bool {
+        matches!(
+            self,
+            TranslateTarget::Portuguese | TranslateTarget::Spanish
+        )
     }
 }
 
@@ -312,7 +450,14 @@ pub struct Config {
     pub model_path: String,
     pub vad_model_path: String,
     pub language: String,
+    #[serde(default)]
+    pub initial_prompt: String,
+    #[serde(default, skip_serializing)]
     pub translate: bool,
+    #[serde(default)]
+    pub translate_to: TranslateTarget,
+    #[serde(default)]
+    pub translation_provider: TranslationProvider,
     pub beam_size: i32,
     pub vad: bool,
     pub vad_min_silence_ms: i32,
@@ -330,6 +475,8 @@ pub struct Config {
     pub subtitle_max_duration: f64,
     pub use_ai_paragraphs: bool,
     pub paragraph_model_path: String,
+    #[serde(default)]
+    pub translation_model_path: String,
     pub paragraph_pause_ms: i32,
     pub paragraph_max_chars: usize,
     #[serde(default)]
@@ -342,8 +489,11 @@ impl Default for Config {
             model_path: default_model_path().display().to_string(),
             vad_model_path: default_vad_model_path().display().to_string(),
             language: "pt".to_string(),
+            initial_prompt: String::new(),
             translate: false,
-            beam_size: 1,
+            translate_to: TranslateTarget::None,
+            translation_provider: TranslationProvider::Google,
+            beam_size: 5,
             vad: true,
             vad_min_silence_ms: 500,
             chunk_seconds: 30.0,
@@ -362,9 +512,14 @@ impl Default for Config {
             paragraph_model_path: default_paragraph_model_path()
                 .display()
                 .to_string(),
+            translation_model_path: translation_model_path(
+                "qwen2.5-3b-instruct-q4_k_m.gguf",
+            )
+            .display()
+            .to_string(),
             paragraph_pause_ms: 1500,
             paragraph_max_chars: 1200,
-            config_version: 1,
+            config_version: 5,
         }
     }
 }
@@ -383,11 +538,47 @@ impl Config {
     }
 
     fn migrate(&mut self) -> bool {
-        if self.config_version >= 1 {
-            return false;
+        let mut changed = false;
+        if self.config_version < 2 {
+            if self.translate && self.translate_to == TranslateTarget::None {
+                self.translate_to = TranslateTarget::English;
+            }
+            self.translate = false;
+            self.config_version = 2;
+            changed = true;
         }
-        self.config_version = 1;
-        true
+        if self.config_version < 3 {
+            if self.translation_model_path.trim().is_empty() {
+                self.translation_model_path = translation_model_path(
+                    "qwen2.5-3b-instruct-q4_k_m.gguf",
+                )
+                .display()
+                .to_string();
+            }
+            self.config_version = 3;
+            changed = true;
+        }
+        if self.config_version < 4 {
+            if self.beam_size == 1 {
+                self.beam_size = 5;
+            }
+            self.config_version = 4;
+            changed = true;
+        }
+        if self.config_version < 5 {
+            self.flash_attn = false;
+            self.config_version = 5;
+            changed = true;
+        }
+        changed
+    }
+
+    pub fn translation_model(&self) -> &str {
+        if self.translation_model_path.trim().is_empty() {
+            &self.paragraph_model_path
+        } else {
+            &self.translation_model_path
+        }
     }
 
     pub fn save(&self) {
@@ -462,5 +653,19 @@ pub fn human_size(bytes: u64) -> String {
         format!("{bytes} {}", UNITS[unit])
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_mkv_extension_case_insensitively() {
+        assert!(is_video(Path::new("aula.mkv")));
+        assert!(is_video(Path::new("aula.MKV")));
+        assert!(is_video(Path::new("aula.WebM")));
+        assert!(!is_video(Path::new("aula.txt")));
     }
 }

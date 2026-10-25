@@ -66,6 +66,8 @@ jobs:
   windows-cuda:
     runs-on: windows-2022
     continue-on-error: true
+    env:
+      CMAKE_CUDA_ARCHITECTURES: "75;80;86;89;120"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -83,6 +85,7 @@ jobs:
           $env:FFMPEG_BIN = (Get-Command ffmpeg).Source
           $env:CUDAToolkit_ROOT = $env:CUDA_PATH
           $env:CMAKE_CUDA_COMPILER = Join-Path $env:CUDA_PATH "bin\nvcc.exe"
+          $env:CMAKE_CUDA_ARCHITECTURES = "75;80;86;89;120"
           ./packaging/build-windows.ps1 -Features cuda
       - uses: actions/upload-artifact@v4
         with:
@@ -95,6 +98,8 @@ jobs:
     continue-on-error: true
     container:
       image: nvidia/cuda:13.0.0-devel-ubuntu22.04
+    env:
+      CMAKE_CUDA_ARCHITECTURES: "75;80;86;89;120"
     steps:
       - name: Instalar git e ferramentas básicas
         run: |

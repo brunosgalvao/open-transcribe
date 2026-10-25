@@ -1,6 +1,6 @@
 [package]
 name = "open-transcribe"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Transcrição local de vídeos e aulas com Whisper e parágrafos por LLM local."
 authors = ["Bruno Galvão"]
@@ -12,7 +12,7 @@ categories = ["audio", "multimedia"]
 
 [features]
 default = ["cuda"]
-cuda = ["whisper-rs/cuda"]
+cuda = ["whisper-rs/cuda", "llama-cpp-2/cuda"]
 metal = ["whisper-rs/metal"]
 vulkan = ["whisper-rs/vulkan"]
 

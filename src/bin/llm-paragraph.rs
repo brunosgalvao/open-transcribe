@@ -80,7 +80,7 @@ fn run() -> Result<()> {
     let model = LlamaModel::load_from_file(
         &backend,
         &model_path,
-        &LlamaModelParams::default(),
+        &LlamaModelParams::default().with_n_gpu_layers(99),
     )
     .with_context(|| format!("falha ao carregar {}", model_path.display()))?;
     let template = model
