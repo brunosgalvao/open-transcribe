@@ -128,6 +128,26 @@ fn nvml_free_vram() -> Option<u64> {
 }
 
 #[cfg(feature = "cuda")]
+fn reset_cuda_device() {
+    unsafe {
+        let Some(library) = ["libcudart.so.13", "libcudart.so", "libcudart.so.12"]
+            .iter()
+            .find_map(|name| libloading::Library::new(name).ok())
+        else {
+            return;
+        };
+        let Ok(reset) = library.get::<unsafe extern "C" fn() -> i32>(b"cudaDeviceReset\0")
+        else {
+            return;
+        };
+        let _ = reset();
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn reset_cuda_device() {}
+
+#[cfg(feature = "cuda")]
 fn nvidia_smi_free_vram() -> Option<u64> {
     for command in ["nvidia-smi", "/usr/bin/nvidia-smi"] {
         let Ok(output) = Command::new(command)
@@ -171,9 +191,6 @@ fn run_job_inner(
     std::fs::create_dir_all(&cfg.output_dir)
         .with_context(|| format!("não foi possível criar a pasta de saída {}", cfg.output_dir))?;
 
-    send(tx, Event::Log("Carregando modelo Whisper...".to_string()));
-    send(tx, Event::ModelLoading);
-
     #[cfg(feature = "cuda")]
     let mut use_gpu = cfg.use_gpu && platform::gpu_enabled();
     #[cfg(not(feature = "cuda"))]
@@ -198,24 +215,11 @@ fn run_job_inner(
         }
     }
 
-    let mut ctx_params = WhisperContextParameters::default();
-    ctx_params.use_gpu(use_gpu);
-    if cfg.flash_attn {
-        ctx_params.flash_attn(true);
-    }
-
-    let ctx = WhisperContext::new_with_params(&model_path, ctx_params)
-        .map_err(|e| anyhow!("falha ao carregar o modelo: {e}"))?;
-
     let backend = if use_gpu {
         format!("GPU ({})", platform::gpu_backend())
     } else {
         "CPU".to_string()
     };
-    send(
-        tx,
-        Event::Log(format!("Modelo carregado — processando em {backend}.")),
-    );
 
     let vad_available = cfg.vad && Path::new(&cfg.vad_model_path).is_file();
     if cfg.vad && !vad_available {
@@ -233,7 +237,19 @@ fn run_job_inner(
             return Ok(());
         }
 
-        if let Err(err) = transcribe_file(&ctx, cfg, file, index, tx, cancel, vad_available) {
+        let result = transcribe_file(
+            &model_path,
+            use_gpu,
+            &backend,
+            cfg,
+            file,
+            index,
+            tx,
+            cancel,
+            vad_available,
+        );
+
+        if let Err(err) = result {
             if cancel.load(Ordering::Relaxed) {
                 send(tx, Event::Cancelled { index });
                 return Ok(());
@@ -251,8 +267,166 @@ fn run_job_inner(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn chunk_params<'a>(
+    cfg: &Config,
+    language_code: Option<&'a str>,
+    vad_available: bool,
+    index: usize,
+    offset_samples: usize,
+    chunk_len: usize,
+    total_samples: usize,
+    tx: &Sender<Event>,
+    cancel: &Arc<AtomicBool>,
+) -> FullParams<'a, 'static> {
+    let mut params = FullParams::new(match cfg.beam_size.max(1) {
+        1 => SamplingStrategy::Greedy { best_of: 1 },
+        n => SamplingStrategy::BeamSearch {
+            beam_size: n,
+            patience: -1.0,
+        },
+    });
+
+    params.set_language(language_code);
+    params.set_detect_language(language_code.is_none());
+
+    let initial_prompt = cfg.initial_prompt.trim();
+    if !initial_prompt.is_empty() {
+        params.set_initial_prompt(initial_prompt);
+    }
+    if cfg.output_mode == OutputMode::Srt {
+        params.set_max_len(80);
+        params.set_split_on_word(true);
+    }
+    params.set_n_threads(cfg.threads.clamp(1, 64));
+    params.set_no_context(true);
+    params.set_suppress_nst(true);
+    params.set_entropy_thold(2.0);
+    params.set_translate(cfg.translate_to == TranslateTarget::English);
+    params.set_print_special(false);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    params.set_no_timestamps(false);
+
+    if vad_available {
+        params.set_vad_model_path(Some(&cfg.vad_model_path));
+        let mut vad_params = WhisperVadParams::default();
+        vad_params.set_threshold(0.5);
+        vad_params.set_min_silence_duration(cfg.vad_min_silence_ms.clamp(0, 60_000));
+        params.set_vad_params(vad_params);
+        params.enable_vad(true);
+    }
+
+    let progress_tx = tx.clone();
+    let total = total_samples.max(1);
+    params.set_progress_callback_safe(move |percent: i32| {
+        let overall = ((offset_samples as f64 + (percent as f64 / 100.0) * chunk_len as f64)
+            / total as f64
+            * 100.0)
+            .clamp(0.0, 100.0) as i32;
+        send(
+            &progress_tx,
+            Event::Progress {
+                index,
+                percent: overall,
+            },
+        );
+    });
+
+    let segment_tx = tx.clone();
+    let mut last_preview = String::new();
+    params.set_segment_callback_safe(move |data: whisper_rs::SegmentCallbackData| {
+        let text = data.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let key = text.trim().to_lowercase();
+        if text.is_empty() || key == last_preview.trim().to_lowercase() {
+            return;
+        }
+        last_preview = text.clone();
+        send(&segment_tx, Event::Partial { index, text });
+    });
+
+    let abort_cancel = cancel.clone();
+    params.set_abort_callback_safe(move || abort_cancel.load(Ordering::Relaxed));
+
+    params
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transcribe_chunk(
+    model_path: &Path,
+    use_gpu: bool,
+    cfg: &Config,
+    language_code: Option<&str>,
+    vad_available: bool,
+    index: usize,
+    offset_samples: usize,
+    chunk: &[f32],
+    total_samples: usize,
+    tx: &Sender<Event>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(Vec<Segment>, Option<&'static str>)> {
+    let mut ctx_params = WhisperContextParameters::default();
+    ctx_params.use_gpu(use_gpu);
+    if cfg.flash_attn {
+        ctx_params.flash_attn(true);
+    }
+    let ctx = match WhisperContext::new_with_params(model_path, ctx_params) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            if use_gpu {
+                reset_cuda_device();
+            }
+            return Err(anyhow!("falha ao carregar o modelo: {err}"));
+        }
+    };
+    let mut state = match ctx.create_state() {
+        Ok(state) => state,
+        Err(err) => {
+            drop(ctx);
+            if use_gpu {
+                reset_cuda_device();
+            }
+            return Err(anyhow!("falha ao criar o estado do Whisper: {err}"));
+        }
+    };
+    let params = chunk_params(
+        cfg,
+        language_code,
+        vad_available,
+        index,
+        offset_samples,
+        chunk.len(),
+        total_samples,
+        tx,
+        cancel,
+    );
+    match state.full(params, chunk) {
+        Ok(()) => {
+            let segments = collect_segments(&state);
+            let language = whisper_rs::get_lang_str(state.full_lang_id_from_state());
+            drop(state);
+            drop(ctx);
+            if use_gpu {
+                reset_cuda_device();
+            }
+            Ok((segments, language))
+        }
+        Err(err) => {
+            drop(state);
+            drop(ctx);
+            if use_gpu {
+                reset_cuda_device();
+            }
+            Err(anyhow!("{err}"))
+        }
+    }
+}
+
 fn transcribe_file(
-    ctx: &WhisperContext,
+    model_path: &Path,
+    use_gpu: bool,
+    backend: &str,
     cfg: &Config,
     file: &Path,
     index: usize,
@@ -307,26 +481,25 @@ fn transcribe_file(
     }
 
     let language = cfg.language.trim();
-    let auto_language = language.is_empty() || language.eq_ignore_ascii_case("auto");
-    let language_code = if auto_language {
-        match detect_language(ctx, &pcm, cfg.threads.clamp(1, 64)) {
-            Some(code) => {
-                send(tx, Event::Log(format!("Idioma detectado: {code}.")));
-                Some(code)
-            }
-            None => None,
-        }
-    } else {
-        Some(language)
-    };
+    let mut language_code: Option<&str> =
+        if language.is_empty() || language.eq_ignore_ascii_case("auto") {
+            None
+        } else {
+            Some(language)
+        };
 
     let target = cfg.translate_to;
     let target_code = target.code();
     let total_samples = pcm.len();
     let chunk_samples = 300 * 16_000;
     let mut segments: Vec<Segment> = Vec::new();
-    let mut offset_samples = (90 * 16_000).min(total_samples);
+    let mut failed_chunks: Vec<(f64, f64)> = Vec::new();
+    let mut offset_samples = 0usize;
     let mut chunk_index = 0usize;
+    let mut context_logged = false;
+
+    send(tx, Event::Log("Carregando modelo Whisper...".to_string()));
+    send(tx, Event::ModelLoading);
 
     while offset_samples < total_samples {
         let size = chunk_samples.min(total_samples - offset_samples);
@@ -337,112 +510,84 @@ fn transcribe_file(
         }
         let offset_seconds = offset_samples as f64 / 16_000.0;
 
-        let mut params = FullParams::new(match cfg.beam_size.max(1) {
-            1 => SamplingStrategy::Greedy { best_of: 1 },
-            n => SamplingStrategy::BeamSearch {
-                beam_size: n,
-                patience: -1.0,
-            },
-        });
-
-        if let Some(code) = language_code {
-            params.set_language(Some(code));
-            params.set_detect_language(false);
-        } else {
-            params.set_language(None);
-            params.set_detect_language(true);
-        }
-
-        let initial_prompt = cfg.initial_prompt.trim();
-        if !initial_prompt.is_empty() {
-            params.set_initial_prompt(initial_prompt);
-        }
-        if cfg.output_mode == OutputMode::Srt {
-            params.set_max_len(80);
-            params.set_split_on_word(true);
-        }
-        params.set_n_threads(cfg.threads.clamp(1, 64));
-        params.set_no_context(true);
-        params.set_suppress_nst(true);
-        params.set_entropy_thold(2.0);
-        params.set_translate(target == TranslateTarget::English);
-        params.set_print_special(false);
-        params.set_print_progress(false);
-        params.set_print_realtime(false);
-        params.set_print_timestamps(false);
-        params.set_no_timestamps(false);
-
-        if vad_available {
-            params.set_vad_model_path(Some(&cfg.vad_model_path));
-            let mut vad_params = WhisperVadParams::default();
-            vad_params.set_threshold(0.5);
-            vad_params.set_min_silence_duration(cfg.vad_min_silence_ms.clamp(0, 60_000));
-            params.set_vad_params(vad_params);
-            params.enable_vad(true);
-        }
-
-        let progress_tx = tx.clone();
-        let chunk_len = chunk.len();
-        let base_samples = offset_samples;
-        let total = total_samples.max(1);
-        params.set_progress_callback_safe(move |percent: i32| {
-            let overall = ((base_samples as f64
-                + (percent as f64 / 100.0) * chunk_len as f64)
-                / total as f64
-                * 100.0)
-                .clamp(0.0, 100.0) as i32;
-            send(
-                &progress_tx,
-                Event::Progress {
-                    index,
-                    percent: overall,
-                },
-            );
-        });
-
-        let segment_tx = tx.clone();
-        let mut last_preview = String::new();
-        params.set_segment_callback_safe(move |data: whisper_rs::SegmentCallbackData| {
-            let text = data.text.split_whitespace().collect::<Vec<_>>().join(" ");
-            let key = text.trim().to_lowercase();
-            if text.is_empty() || key == last_preview.trim().to_lowercase() {
-                return;
-            }
-            last_preview = text.clone();
-            send(
-                &segment_tx,
-                Event::Partial {
-                    index,
-                    text,
-                },
-            );
-        });
-
-        let abort_cancel = cancel.clone();
-        params.set_abort_callback_safe(move || abort_cancel.load(Ordering::Relaxed));
-
-        let mut state = ctx
-            .create_state()
-            .map_err(|e| anyhow!("falha ao criar o estado do Whisper: {e}"))?;
-
-        if let Err(err) = state.full(params, chunk) {
+        let mut chunk_result: Option<(Vec<Segment>, Option<&'static str>)> = None;
+        let mut last_error = None;
+        for attempt in 1..=5 {
             if cancel.load(Ordering::Relaxed) {
                 send(tx, Event::Cancelled { index });
                 return Ok(());
             }
+            match transcribe_chunk(
+                model_path,
+                use_gpu,
+                cfg,
+                language_code,
+                vad_available,
+                index,
+                offset_samples,
+                chunk,
+                total_samples,
+                tx,
+                cancel,
+            ) {
+                Ok(result) => {
+                    if !context_logged {
+                        send(
+                            tx,
+                            Event::Log(format!(
+                                "Modelo carregado — processando em {backend}."
+                            )),
+                        );
+                        context_logged = true;
+                    }
+                    chunk_result = Some(result);
+                    break;
+                }
+                Err(err) => {
+                    if cancel.load(Ordering::Relaxed) {
+                        send(tx, Event::Cancelled { index });
+                        return Ok(());
+                    }
+                    let reason = format!("{err:#}");
+                    last_error = Some(reason.clone());
+                    if attempt < 5 {
+                        send(
+                            tx,
+                            Event::Log(format!(
+                                "Aviso: falha no trecho {} da transcrição ({reason}); tentando novamente ({attempt}/5).",
+                                chunk_index + 1
+                            )),
+                        );
+                    }
+                }
+            }
+        }
+
+        let Some((mut chunk_segments, detected_language)) = chunk_result else {
+            let reason = last_error.unwrap_or_else(|| "erro desconhecido".to_string());
             send(
                 tx,
                 Event::Log(format!(
-                    "Aviso: falha no trecho {} da transcrição ({err}); seguindo para o próximo.",
+                    "Aviso: falha no trecho {} da transcrição ({reason}) após 5 tentativas; o trecho será omitido.",
                     chunk_index + 1
                 )),
             );
+            failed_chunks.push((
+                offset_seconds,
+                offset_seconds + size as f64 / 16_000.0,
+            ));
             offset_samples += size;
             chunk_index += 1;
             continue;
+        };
+
+        if language_code.is_none() {
+            if let Some(code) = detected_language {
+                send(tx, Event::Log(format!("Idioma detectado: {code}.")));
+                language_code = Some(code);
+            }
         }
 
-        let mut chunk_segments = collect_segments(&state);
         for segment in &mut chunk_segments {
             segment.start += offset_seconds;
             segment.end += offset_seconds;
@@ -455,6 +600,27 @@ fn transcribe_file(
     if cancel.load(Ordering::Relaxed) {
         send(tx, Event::Cancelled { index });
         return Ok(());
+    }
+
+    if !failed_chunks.is_empty() {
+        let ranges = failed_chunks
+            .iter()
+            .map(|(start, end)| {
+                format!(
+                    "{}–{}",
+                    config::format_duration(*start),
+                    config::format_duration(*end)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        send(
+            tx,
+            Event::Log(format!(
+                "Aviso: a transcrição ficou incompleta; falhou em {} trecho(s): {ranges}.",
+                failed_chunks.len()
+            )),
+        );
     }
 
     let needs_translation = target.is_local() && language_code != target_code;
@@ -660,57 +826,6 @@ fn collapse_repetitions(segments: &mut Vec<Segment>) -> usize {
     }
     *segments = deduped;
     removed
-}
-
-fn detect_language(
-    ctx: &WhisperContext,
-    pcm: &[f32],
-    threads: i32,
-) -> Option<&'static str> {
-    let threads = threads.clamp(1, 64) as usize;
-    let window = 30 * 16_000;
-    let total = pcm.len();
-    let mut offsets = vec![0usize];
-    if total > window {
-        offsets.push((total / 2).saturating_sub(window / 2));
-        offsets.push(total - window);
-    }
-    offsets.sort_unstable();
-    offsets.dedup();
-
-    let mut votes: Vec<(&'static str, f32)> = Vec::new();
-    for offset in offsets {
-        let start = offset.min(total);
-        let end = (start + window).min(total);
-        if end.saturating_sub(start) < 5 * 16_000 {
-            continue;
-        }
-        let mut state = ctx.create_state().ok()?;
-        state.pcm_to_mel(&pcm[start..end], threads).ok()?;
-        let (language_id, probabilities) = state.lang_detect(0, threads).ok()?;
-        let Some(language) = whisper_rs::get_lang_str(language_id) else {
-            continue;
-        };
-        let probability = probabilities
-            .get(language_id as usize)
-            .copied()
-            .unwrap_or(0.0)
-            .max(0.01);
-        votes.push((language, probability));
-    }
-
-    let mut best: Option<(&'static str, f32)> = None;
-    for (language, _) in &votes {
-        let score: f32 = votes
-            .iter()
-            .filter(|(candidate, _)| candidate == language)
-            .map(|(_, probability)| probability)
-            .sum();
-        if best.is_none_or(|(_, best_score)| score > best_score) {
-            best = Some((language, score));
-        }
-    }
-    best.map(|(language, _)| language)
 }
 
 fn group_segments(segments: &[Segment], chunk_seconds: f64) -> Vec<Chunk> {
