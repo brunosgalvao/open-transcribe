@@ -6,6 +6,11 @@ cd "$ROOT"
 
 export PATH="$HOME/.cargo/bin:$PATH"
 NAME="OpenTranscribe"
+VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -n 1)"
+if [[ -z "$VERSION" ]]; then
+    echo "ERRO: não foi possível ler a versão de Cargo.toml." >&2
+    exit 1
+fi
 APP="$ROOT/dist/$NAME.app"
 DMG="$ROOT/dist/$NAME-macos-$(uname -m).dmg"
 
@@ -59,9 +64,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>$VERSION</string>
     <key>CFBundleVersion</key>
-    <string>0.1.0</string>
+    <string>$VERSION</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
     <key>NSHighResolutionCapable</key>

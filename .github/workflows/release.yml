@@ -57,6 +57,21 @@ jobs:
         run: |
           $env:FFMPEG_BIN = (Get-Command ffmpeg).Source
           ./packaging/build-windows.ps1 -Features cpu
+      - name: Verificar pacote Windows (CPU)
+        shell: pwsh
+        run: |
+          $stage = "dist/windows-CPU"
+          $zip = "dist/OpenTranscribe-CPU-windows-x86_64.zip"
+          if (-not (Test-Path $zip)) { throw "Zip não gerado: $zip" }
+          $required = @("OpenTranscribe.exe", "llm-paragraph.exe", "llm-translate.exe", "ffmpeg.exe")
+          foreach ($file in $required) {
+            if (-not (Test-Path (Join-Path $stage $file))) { throw "Faltando $file no pacote" }
+          }
+          $ffmpeg = Join-Path $stage "ffmpeg.exe"
+          $size = (Get-Item $ffmpeg).Length
+          if ($size -lt 1MB) { throw "ffmpeg.exe inválido ($size bytes)" }
+          & $ffmpeg -version | Select-Object -First 1
+          "### Windows CPU`nffmpeg.exe: $size bytes`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
       - uses: actions/upload-artifact@v4
         with:
           name: windows-zip
@@ -65,18 +80,64 @@ jobs:
 
   windows-cuda:
     runs-on: windows-2022
-    continue-on-error: true
     env:
-      CMAKE_CUDA_ARCHITECTURES: "75;80;86;89;120"
+      CMAKE_CUDA_ARCHITECTURES: "75-real;86-real;89-real;120-virtual"
+      NVCC_PREPEND_FLAGS: "-Xcompiler /MD"
+      CMAKE_MSVC_RUNTIME_LIBRARY: "MultiThreadedDLL"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_RELEASE_LTO: "false"
     steps:
       - uses: actions/checkout@v4
+      - name: Liberar espaço em disco
+        shell: pwsh
+        run: |
+          Write-Host "Disco antes da limpeza:"
+          Get-PSDrive C | Format-Table -AutoSize
+          $paths = @(
+            "C:\Android",
+            "C:\Program Files (x86)\Android",
+            "C:\Strawberry",
+            "C:\ghcup",
+            "C:\hostedtoolcache\windows\Ruby",
+            "C:\hostedtoolcache\windows\PyPy",
+            "C:\hostedtoolcache\windows\go",
+            "C:\Program Files\Google\Chrome",
+            "C:\Program Files (x86)\Microsoft\Edge",
+            "C:\Program Files\Mozilla Firefox",
+            "C:\Program Files\dotnet",
+            "C:\Program Files\Microsoft SDKs",
+            "C:\Program Files (x86)\Microsoft SDKs"
+          )
+          foreach ($path in $paths) {
+            if (Test-Path $path) {
+              Write-Host "Removendo $path"
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $path
+            }
+          }
+          Write-Host "Disco depois da limpeza:"
+          Get-PSDrive C | Format-Table -AutoSize
+      - name: Configurar MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Instalar LLVM (libclang)
+        shell: pwsh
+        run: |
+          choco install llvm -y --no-progress
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Instalar CUDA Toolkit
         uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: '13.0.0'
           method: 'local'
+      - name: Verificar nvcc
+        shell: pwsh
+        run: |
+          if (-not (Get-Command nvcc -ErrorAction SilentlyContinue)) { throw "nvcc não encontrado" }
+          nvcc --version
       - name: Instalar ffmpeg
         run: choco install ffmpeg -y --no-progress
       - name: Gerar pacote Windows CUDA
@@ -85,8 +146,38 @@ jobs:
           $env:FFMPEG_BIN = (Get-Command ffmpeg).Source
           $env:CUDAToolkit_ROOT = $env:CUDA_PATH
           $env:CMAKE_CUDA_COMPILER = Join-Path $env:CUDA_PATH "bin\nvcc.exe"
-          $env:CMAKE_CUDA_ARCHITECTURES = "75;80;86;89;120"
-          ./packaging/build-windows.ps1 -Features cuda
+          $log = Join-Path $env:RUNNER_TEMP "windows-cuda-build.log"
+          try {
+            & ./packaging/build-windows.ps1 -Features cuda 2>&1 | Tee-Object -FilePath $log
+            if ($LASTEXITCODE -ne 0) { throw "build-windows.ps1 saiu com código $LASTEXITCODE" }
+          } catch {
+            $tail = (Get-Content $log -Tail 100 -ErrorAction SilentlyContinue) -join "`n"
+            "### Falha no build Windows CUDA`n``````n$tail`n``````" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            $short = $tail
+            if ($short.Length -gt 1800) { $short = $short.Substring($short.Length - 1800) }
+            Write-Host "::error title=Falha no build Windows CUDA::$(($short -replace "`r?`n", "%0A"))"
+            throw
+          }
+      - name: Verificar pacote Windows CUDA
+        shell: pwsh
+        run: |
+          $stage = "dist/windows-CUDA"
+          $zip = "dist/OpenTranscribe-CUDA-windows-x86_64.zip"
+          if (-not (Test-Path $zip)) { throw "Zip não gerado: $zip" }
+          $required = @("OpenTranscribe.exe", "llm-paragraph.exe", "llm-translate.exe", "ffmpeg.exe")
+          foreach ($file in $required) {
+            if (-not (Test-Path (Join-Path $stage $file))) { throw "Faltando $file no pacote" }
+          }
+          $ffmpeg = Join-Path $stage "ffmpeg.exe"
+          $size = (Get-Item $ffmpeg).Length
+          if ($size -lt 1MB) { throw "ffmpeg.exe inválido ($size bytes)" }
+          & $ffmpeg -version | Select-Object -First 1
+          foreach ($pattern in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")) {
+            if (-not (Get-ChildItem $stage -Filter $pattern -ErrorAction SilentlyContinue)) {
+              throw "Faltando $pattern no pacote"
+            }
+          }
+          "### Windows CUDA`nffmpeg.exe: $size bytes`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
       - uses: actions/upload-artifact@v4
         with:
           name: windows-cuda-zip
@@ -95,7 +186,6 @@ jobs:
 
   linux-cuda:
     runs-on: ubuntu-22.04
-    continue-on-error: true
     container:
       image: nvidia/cuda:13.0.0-devel-ubuntu22.04
     env:
@@ -183,7 +273,7 @@ jobs:
 
   release:
     needs: [linux, windows, macos, linux-cuda, windows-cuda]
-    if: always() && needs.linux.result == 'success' && needs.windows.result == 'success' && needs.macos.result == 'success'
+    if: always() && needs.linux.result == 'success' && needs.windows.result == 'success' && needs.macos.result == 'success' && needs.linux-cuda.result == 'success' && needs.windows-cuda.result == 'success'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@v4

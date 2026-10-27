@@ -7,6 +7,24 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
+if ($Features -eq "cuda") {
+    if ($env:CUDA_PATH) {
+        if (-not $env:CUDAToolkit_ROOT) { $env:CUDAToolkit_ROOT = $env:CUDA_PATH }
+        if (-not $env:CMAKE_CUDA_COMPILER) {
+            $env:CMAKE_CUDA_COMPILER = Join-Path $env:CUDA_PATH "bin\nvcc.exe"
+        }
+    }
+    $mdFlag = "-Xcompiler /MD"
+    if ($env:NVCC_PREPEND_FLAGS) {
+        $env:NVCC_PREPEND_FLAGS = "$mdFlag $env:NVCC_PREPEND_FLAGS"
+    } else {
+        $env:NVCC_PREPEND_FLAGS = $mdFlag
+    }
+    if (-not $env:CMAKE_MSVC_RUNTIME_LIBRARY) {
+        $env:CMAKE_MSVC_RUNTIME_LIBRARY = "MultiThreadedDLL"
+    }
+}
+
 Write-Host "[1/4] Compilando (release, $Features)..."
 if ($Features -eq "cpu") {
     cargo build --release --no-default-features
@@ -39,11 +57,31 @@ if (-not $ffmpeg) {
     $command = Get-Command ffmpeg -ErrorAction SilentlyContinue
     if ($command) { $ffmpeg = $command.Source }
 }
-if ($ffmpeg -and (Test-Path $ffmpeg)) {
-    Copy-Item $ffmpeg (Join-Path $Stage "ffmpeg.exe")
-} else {
-    Write-Warning "ffmpeg.exe não encontrado; o aplicativo exigirá ffmpeg no PATH."
+
+function Resolve-RealFfmpeg([string]$Path) {
+    if (-not $Path -or -not (Test-Path $Path)) { return $null }
+    if ((Get-Item $Path).Length -ge 1MB) { return (Get-Item $Path).FullName }
+
+    $roots = @()
+    if ($env:ChocolateyInstall) {
+        $roots += (Join-Path $env:ChocolateyInstall "lib\ffmpeg\tools")
+    }
+    $roots += "C:\ProgramData\chocolatey\lib\ffmpeg\tools"
+    foreach ($root in $roots) {
+        if (-not (Test-Path $root)) { continue }
+        $real = Get-ChildItem $root -Recurse -Filter "ffmpeg.exe" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Length -ge 1MB } |
+            Select-Object -First 1
+        if ($real) { return $real.FullName }
+    }
+    return $null
 }
+
+$ffmpeg = Resolve-RealFfmpeg $ffmpeg
+if (-not $ffmpeg) {
+    throw "ffmpeg real não encontrado. Instale o ffmpeg completo ou defina FFMPEG_BIN."
+}
+Copy-Item $ffmpeg (Join-Path $Stage "ffmpeg.exe")
 
 if ($Features -eq "cuda" -and $env:CUDA_PATH) {
     Write-Host "[3/4] Copiando DLLs do CUDA..."

@@ -94,8 +94,8 @@ O script gera o `.app` e o `.dmg` com Metal habilitado.
 O workflow `.github/workflows/release.yml` gera os pacotes de Linux, Windows e macOS quando uma tag `v*` é enviada:
 
 ```bash
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 Ele cria uma release **draft** no GitHub para revisão antes de publicar.

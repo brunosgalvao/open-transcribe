@@ -129,8 +129,18 @@ fn nvml_free_vram() -> Option<u64> {
 
 #[cfg(feature = "cuda")]
 fn reset_cuda_device() {
+    let libraries: &[&str] = if cfg!(windows) {
+        &[
+            "cudart64_13.dll",
+            "cudart64_12.dll",
+            "cudart64_11.dll",
+            "cudart64_110.dll",
+        ]
+    } else {
+        &["libcudart.so.13", "libcudart.so.12", "libcudart.so"]
+    };
     unsafe {
-        let Some(library) = ["libcudart.so.13", "libcudart.so", "libcudart.so.12"]
+        let Some(library) = libraries
             .iter()
             .find_map(|name| libloading::Library::new(name).ok())
         else {
